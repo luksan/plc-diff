@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use quick_xml::events::{BytesText, Event};
+use quick_xml::events::{BytesStart, BytesText, Event};
 use quick_xml::{Reader, Writer};
 
 use std::collections::HashMap;
@@ -33,6 +33,28 @@ impl From<BytesText<'static>> for Txt {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum CurrentTag {
+    Id,
+    To,
+    From,
+    InstructionLine,
+    Other,
+    None,
+}
+
+impl From<&BytesStart<'_>> for CurrentTag {
+    fn from(tag: &BytesStart) -> Self {
+        match tag.local_name() {
+            b"Id" => Self::Id,
+            b"From" => Self::From,
+            b"To" => Self::To,
+            b"InstructionLine" => Self::InstructionLine,
+            _ => Self::Other,
+        }
+    }
+}
+
 fn load_xml(filename: &Path) -> Result<()> {
     let mut reader = Reader::from_file(filename)?;
 
@@ -41,7 +63,7 @@ fn load_xml(filename: &Path) -> Result<()> {
 
     let mut writer = Writer::new(out);
 
-    let mut id = false;
+    let mut current_tag = CurrentTag::None;
     let mut id_count = 0;
     let mut id_map = HashMap::<Txt, u32>::new();
     let mut read_buf = Vec::new();
@@ -49,17 +71,15 @@ fn load_xml(filename: &Path) -> Result<()> {
         let ev = reader.read_event(&mut read_buf)?;
         let new = match &ev {
             Event::Start(st) => {
-                id = st.local_name() == b"Id"
-                    || st.local_name() == b"To"
-                    || st.local_name() == b"From";
+                current_tag = st.into();
                 ev
             }
             Event::End(_) => {
-                id = false;
+                current_tag = CurrentTag::None;
                 ev
             }
-            Event::Text(txt) => {
-                if id {
+            Event::Text(txt) => match current_tag {
+                CurrentTag::Id | CurrentTag::To | CurrentTag::From => {
                     let new = id_map
                         .entry(txt.clone().into_owned().into())
                         .or_insert_with(|| {
@@ -67,10 +87,22 @@ fn load_xml(filename: &Path) -> Result<()> {
                             id_count
                         });
                     Event::Text(BytesText::from_escaped_str(format!("=={}==", new)))
-                } else {
-                    ev
                 }
-            }
+                CurrentTag::InstructionLine => {
+                    // normalize whitespace
+                    let mut new = Vec::new();
+                    for word in (*txt).split(|c| c.is_ascii_whitespace()) {
+                        if word.is_empty() {
+                            continue;
+                        }
+                        new.extend_from_slice(word);
+                        new.push(b' ');
+                    }
+                    new.pop();
+                    Event::Text(BytesText::from_escaped(new))
+                }
+                _ => ev,
+            },
             Event::Eof => break,
             _ => ev,
         };
