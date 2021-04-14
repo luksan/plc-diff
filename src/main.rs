@@ -2,36 +2,14 @@ use anyhow::{Context, Result};
 use quick_xml::events::{BytesStart, BytesText, Event};
 use quick_xml::{Reader, Writer};
 
-use std::collections::HashMap;
 use std::env;
 #[allow(unused_imports)]
 use std::fs::File;
-use std::hash::{Hash, Hasher};
 #[allow(unused_imports)]
 use std::io::BufWriter;
 use std::path::Path;
 
-#[derive(Debug, Clone)]
-struct Txt(BytesText<'static>);
-
-impl PartialEq for Txt {
-    fn eq(&self, other: &Self) -> bool {
-        *self.0 == *other.0
-    }
-}
-impl Eq for Txt {}
-
-impl Hash for Txt {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state)
-    }
-}
-
-impl From<BytesText<'static>> for Txt {
-    fn from(txt: BytesText<'static>) -> Self {
-        Self(txt)
-    }
-}
+use plc_diff::GuidMap;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum CurrentTag {
@@ -64,8 +42,7 @@ fn load_xml(filename: &Path) -> Result<()> {
     let mut writer = Writer::new(out);
 
     let mut current_tag = CurrentTag::None;
-    let mut id_count = 0;
-    let mut id_map = HashMap::<Txt, u32>::new();
+    let mut id_map = GuidMap::new();
     let mut read_buf = Vec::new();
     loop {
         let ev = reader.read_event(&mut read_buf)?;
@@ -80,12 +57,7 @@ fn load_xml(filename: &Path) -> Result<()> {
             }
             Event::Text(txt) => match current_tag {
                 CurrentTag::Id | CurrentTag::To | CurrentTag::From => {
-                    let new = id_map
-                        .entry(txt.clone().into_owned().into())
-                        .or_insert_with(|| {
-                            id_count += 1;
-                            id_count
-                        });
+                    let new = id_map.get_or_insert(txt)?;
                     Event::Text(BytesText::from_escaped_str(format!("=={}==", new)))
                 }
                 CurrentTag::InstructionLine => {
