@@ -1,27 +1,16 @@
-use anyhow::{Context, Error as AnyError, Result};
-use arrayvec::ArrayVec;
-use quick_xml::events::BytesText;
-
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
+use std::path::Path;
 
-#[derive(Debug, Clone)]
+use anyhow::{Context, Error as AnyError, Result};
+use arrayvec::ArrayVec;
+use quick_xml::events::{BytesText, Event};
+use quick_xml::Reader;
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct Guid(ArrayVec<u8, 36>); // "8bff0fc0-0ad4-40a4-a4c7-c6a5c1df96b7"
-
-impl PartialEq for Guid {
-    fn eq(&self, other: &Self) -> bool {
-        *self.0 == *other.0
-    }
-}
-impl Eq for Guid {}
-
-impl Hash for Guid {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state)
-    }
-}
 
 impl TryFrom<&BytesText<'_>> for Guid {
     type Error = AnyError;
@@ -64,5 +53,132 @@ impl GuidMap {
 impl Default for GuidMap {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub fn process_file(
+    smbp_file: &Path,
+    visitors: &mut [&mut dyn FnMut(Event, CurrentTag) -> Result<VisitProcessing>],
+    //visitors: &mut [&mut dyn XmlNodeVisitor], // broken on rust 1.52
+) -> Result<()> {
+    let mut reader =
+        Reader::from_file(smbp_file).context("Failed to create xml reader from path")?;
+
+    let mut read_buf = Vec::new();
+    let mut current_tag = Default::default();
+    loop {
+        let mut ev = reader.read_event(&mut read_buf)?;
+        match &ev {
+            Event::Start(start) => current_tag = start.local_name().into(),
+            Event::End(end) => current_tag = end.local_name().into(),
+            _ => {}
+        };
+        let orig = ev.clone();
+        for visitor in &mut *visitors {
+            ev = match visitor.visit(ev, current_tag)? {
+                VisitProcessing::Continue(event) => event,
+                VisitProcessing::NextNode => break,
+            };
+        }
+        if matches!(orig, Event::End(_)) {
+            current_tag = CurrentTag::None;
+        }
+
+        if matches!(orig, Event::Eof) {
+            break;
+        }
+        read_buf.clear();
+    }
+    Ok(())
+}
+
+pub trait XmlNodeVisitor {
+    fn visit<'a>(
+        &mut self,
+        event: Event<'a>,
+        current_tag: CurrentTag,
+    ) -> Result<VisitProcessing<'a>>;
+}
+impl<T> XmlNodeVisitor for T
+where
+    T: for<'b> FnMut(Event<'b>, CurrentTag) -> Result<VisitProcessing<'b>>,
+{
+    fn visit<'a>(
+        &mut self,
+        event: Event<'a>,
+        current_tag: CurrentTag,
+    ) -> Result<VisitProcessing<'a>> {
+        self(event, current_tag)
+    }
+}
+
+pub enum VisitProcessing<'a> {
+    /// Let the next visitor (if any) process the (possibly modified) node
+    Continue(Event<'a>),
+    /// Skip all remaining visitors and read in the next node
+    NextNode,
+}
+
+#[cfg(test)]
+mod test {
+    use std::path::Path;
+
+    use super::*;
+
+    struct NodeCounter(usize);
+    impl NodeCounter {
+        pub fn count(&mut self) {
+            self.0 += 1;
+        }
+    }
+
+    #[test]
+    fn test_xml_visitor() {
+        let mut counter = NodeCounter(0);
+
+        process_file(
+            &Path::new("tests/orig.smbp"),
+            &mut [
+                // Node visitors
+                &mut |ev, _| Ok(VisitProcessing::Continue(ev)), // Simplest possible
+                &mut |ev, _| {
+                    counter.count();
+                    Ok(VisitProcessing::Continue(ev))
+                }, // Node counter
+            ],
+        )
+        .unwrap();
+
+        println!("Total xml nodes processed: {}", counter.0)
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum CurrentTag {
+    Id,
+    To,
+    From,
+    InstructionLine,
+    LadderElements,
+    Other,
+    None,
+}
+
+impl Default for CurrentTag {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl From<&[u8]> for CurrentTag {
+    fn from(tag: &[u8]) -> Self {
+        match tag {
+            b"Id" => Self::Id,
+            b"From" => Self::From,
+            b"To" => Self::To,
+            b"InstructionLine" => Self::InstructionLine,
+            b"LadderElements" => Self::LadderElements,
+            _ => Self::Other,
+        }
     }
 }
