@@ -56,11 +56,7 @@ impl Default for GuidMap {
     }
 }
 
-pub fn process_file(
-    smbp_file: &Path,
-    visitors: &mut [&mut dyn FnMut(Event, CurrentTag) -> Result<VisitProcessing>],
-    //visitors: &mut [&mut dyn XmlNodeVisitor], // broken on rust 1.52
-) -> Result<()> {
+pub fn process_file(smbp_file: &Path, visitors: &mut [&mut dyn XmlNodeVisitor]) -> Result<()> {
     let mut reader =
         Reader::from_file(smbp_file).context("Failed to create xml reader from path")?;
 
@@ -93,22 +89,15 @@ pub fn process_file(
 }
 
 pub trait XmlNodeVisitor {
-    fn visit<'a>(
-        &mut self,
-        event: Event<'a>,
-        current_tag: CurrentTag,
-    ) -> Result<VisitProcessing<'a>>;
+    fn visit<'a>(&mut self, event: Event<'a>, current: CurrentTag) -> VisitResult<'a>;
 }
+
 impl<T> XmlNodeVisitor for T
 where
-    T: for<'b> FnMut(Event<'b>, CurrentTag) -> Result<VisitProcessing<'b>>,
+    T: for<'b> FnMut(Event<'b>, CurrentTag) -> VisitResult<'b>,
 {
-    fn visit<'a>(
-        &mut self,
-        event: Event<'a>,
-        current_tag: CurrentTag,
-    ) -> Result<VisitProcessing<'a>> {
-        self(event, current_tag)
+    fn visit<'a>(&mut self, event: Event<'a>, current: CurrentTag) -> VisitResult<'a> {
+        self(event, current)
     }
 }
 
@@ -118,6 +107,8 @@ pub enum VisitProcessing<'a> {
     /// Skip all remaining visitors and read in the next node
     NextNode,
 }
+
+pub type VisitResult<'a> = Result<VisitProcessing<'a>>;
 
 #[cfg(test)]
 mod test {
@@ -132,6 +123,13 @@ mod test {
         }
     }
 
+    impl XmlNodeVisitor for NodeCounter {
+        fn visit<'a>(&mut self, event: Event<'a>, _curr: CurrentTag) -> VisitResult<'a> {
+            self.0 += 1;
+            Ok(VisitProcessing::Continue(event))
+        }
+    }
+
     #[test]
     fn test_xml_visitor() {
         let mut counter = NodeCounter(0);
@@ -140,11 +138,7 @@ mod test {
             &Path::new("tests/orig.smbp"),
             &mut [
                 // Node visitors
-                &mut |ev, _| Ok(VisitProcessing::Continue(ev)), // Simplest possible
-                &mut |ev, _| {
-                    counter.count();
-                    Ok(VisitProcessing::Continue(ev))
-                }, // Node counter
+                &mut counter,
             ],
         )
         .unwrap();
