@@ -9,24 +9,48 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
+use arrayvec::ArrayVec;
 use plc_diff::{process_file, CurrentTag, GuidMap, VisitProcessing, VisitResult, XmlNodeVisitor};
+use std::collections::HashMap;
+use std::convert::TryFrom;
 
-#[derive(Debug, Default)]
-struct NormalizeInstructionLine {
+#[derive(Debug)]
+struct NormalizeInstructionLine<'a> {
     in_entity: bool,
     text: Vec<u8>,
+    names: &'a IoNames,
 }
 
-impl NormalizeInstructionLine {
-    fn new() -> NormalizeInstructionLine {
+impl<'a> NormalizeInstructionLine<'a> {
+    fn new(names: &'a IoNames) -> Self {
         Self {
             in_entity: false,
             text: Vec::new(),
+            names,
         }
+    }
+
+    fn normalize_text(&self, txt: &BytesText) -> Vec<u8> {
+        let mut new = Vec::new();
+        for word in (*txt).split(|c| c.is_ascii_whitespace()) {
+            if word.is_empty() {
+                continue;
+            }
+            new.extend_from_slice(word);
+            if let Some(symbol) = self.names.get_symbol(word) {
+                new.resize(new.len() + 1 + 13usize.saturating_sub(new.len()), b' ');
+                new.push(b'[');
+                new.extend_from_slice(symbol);
+                new.push(b']');
+            }
+            new.push(b' ');
+        }
+        new.pop();
+        new
     }
 }
 
-impl XmlNodeVisitor for NormalizeInstructionLine {
+impl XmlNodeVisitor for NormalizeInstructionLine<'_> {
     fn visit<'a>(&mut self, event: Event<'a>, current: CurrentTag) -> Result<VisitProcessing<'a>> {
         match &event {
             Event::Start(_) if current == CurrentTag::InstructionLineEntity => {
@@ -43,7 +67,7 @@ impl XmlNodeVisitor for NormalizeInstructionLine {
                 )));
             }
             Event::Text(txt) => {
-                let mut new = normalize_whitespace(txt);
+                let mut new = self.normalize_text(txt);
                 if !self.text.is_empty() && !new.is_empty() {
                     self.text.push(b'\t');
                 }
@@ -121,7 +145,48 @@ impl<T: std::io::Write> XmlNodeVisitor for EventWriter<T> {
     }
 }
 
+#[derive(Debug, Default)]
+struct IoNames {
+    names: HashMap<ArrayVec<u8, 30>, ArrayVec<u8, 30>>,
+    current: ArrayVec<u8, 30>,
+}
+
+impl IoNames {
+    fn new() -> Self {
+        Self {
+            ..Default::default()
+        }
+    }
+
+    fn get_symbol(&self, address: &[u8]) -> Option<&[u8]> {
+        self.names.get(address).map(|v| v.as_ref())
+    }
+}
+
+impl XmlNodeVisitor for IoNames {
+    fn visit<'a>(&mut self, event: Event<'a>, current: CurrentTag) -> VisitResult<'a> {
+        match &event {
+            Event::Text(txt) if current == CurrentTag::Address => {
+                self.current =
+                    ArrayVec::try_from(&**txt).with_context(|| format!("{:?}", event))?;
+            }
+            Event::Text(txt) if current == CurrentTag::Symbol => {
+                let c = std::mem::replace(&mut self.current, ArrayVec::new());
+                self.names.insert(
+                    c,
+                    ArrayVec::try_from(&**txt).with_context(|| format!("{:?}", event))?,
+                );
+            }
+            _ => {}
+        }
+        Ok(VisitProcessing::Continue(event))
+    }
+}
+
 fn output_visitor(filename: &Path) -> Result<()> {
+    let mut ionames = IoNames::new();
+    process_file(filename, &mut [&mut ionames]).context("Pre-processing failed")?;
+
     // let out = BufWriter::new(File::create("out.xml")?);
     // let out = std::io::sink();
     let out = std::io::stdout();
@@ -129,7 +194,7 @@ fn output_visitor(filename: &Path) -> Result<()> {
     let mut guid_map = GuidVisitor::new();
     let mut writer = EventWriter(Writer::new(out));
     let mut tag_skipper = SkipTag::new(CurrentTag::LadderElements);
-    let mut inst_line_mangle = NormalizeInstructionLine::new();
+    let mut inst_line_mangle = NormalizeInstructionLine::new(&ionames);
     process_file(
         filename,
         &mut [
@@ -139,19 +204,7 @@ fn output_visitor(filename: &Path) -> Result<()> {
             &mut writer,           // write output
         ],
     )
-}
-
-fn normalize_whitespace(txt: &BytesText) -> Vec<u8> {
-    let mut new = Vec::new();
-    for word in (*txt).split(|c| c.is_ascii_whitespace()) {
-        if word.is_empty() {
-            continue;
-        }
-        new.extend_from_slice(word);
-        new.push(b' ');
-    }
-    new.pop();
-    new
+    .context("Post-processing failed")
 }
 
 fn main() -> Result<()> {

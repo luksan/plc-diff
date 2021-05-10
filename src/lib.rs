@@ -11,12 +11,14 @@ use quick_xml::Reader;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum CurrentTag {
+    Address,
     Id,
     To,
     From,
     InstructionLine,
     InstructionLineEntity,
     LadderElements,
+    Symbol,
     Other,
     None,
 }
@@ -30,12 +32,14 @@ impl Default for CurrentTag {
 impl From<&[u8]> for CurrentTag {
     fn from(tag: &[u8]) -> Self {
         match tag {
+            b"Address" => Self::Address,
             b"Id" => Self::Id,
             b"From" => Self::From,
             b"To" => Self::To,
             b"InstructionLine" => Self::InstructionLine,
             b"InstructionLineEntity" => Self::InstructionLineEntity,
             b"LadderElements" => Self::LadderElements,
+            b"Symbol" => Self::Symbol,
             _ => Self::Other,
         }
     }
