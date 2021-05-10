@@ -12,23 +12,46 @@ use std::path::Path;
 use plc_diff::{process_file, CurrentTag, GuidMap, VisitProcessing, VisitResult, XmlNodeVisitor};
 
 #[derive(Debug, Default)]
-struct NormalizeInstructionLine {}
+struct NormalizeInstructionLine {
+    in_entity: bool,
+    text: Vec<u8>,
+}
 
 impl NormalizeInstructionLine {
     fn new() -> NormalizeInstructionLine {
-        Self {}
+        Self {
+            in_entity: false,
+            text: Vec::new(),
+        }
     }
 }
 
 impl XmlNodeVisitor for NormalizeInstructionLine {
     fn visit<'a>(&mut self, event: Event<'a>, current: CurrentTag) -> Result<VisitProcessing<'a>> {
         match &event {
-            Event::Text(txt) if current == CurrentTag::InstructionLine => {
-                return Ok(VisitProcessing::Continue(normalize_whitespace(txt)))
+            Event::Start(_) if current == CurrentTag::InstructionLineEntity => {
+                self.in_entity = true;
+            }
+
+            _ if !self.in_entity => return Ok(VisitProcessing::Continue(event)),
+
+            Event::End(_) if current == CurrentTag::InstructionLineEntity => {
+                self.in_entity = false;
+                let text = std::mem::replace(&mut self.text, Vec::new());
+                return Ok(VisitProcessing::Continue(Event::Text(
+                    BytesText::from_escaped(text),
+                )));
+            }
+            Event::Text(txt) => {
+                let mut new = normalize_whitespace(txt);
+                if !self.text.is_empty() && !new.is_empty() {
+                    self.text.push(b'\t');
+                }
+                self.text.append(&mut new);
             }
             _ => {}
         }
-        Ok(VisitProcessing::Continue(event))
+        Ok(VisitProcessing::NextNode)
     }
 }
 
@@ -118,7 +141,7 @@ fn output_visitor(filename: &Path) -> Result<()> {
     )
 }
 
-fn normalize_whitespace(txt: &BytesText) -> Event<'static> {
+fn normalize_whitespace(txt: &BytesText) -> Vec<u8> {
     let mut new = Vec::new();
     for word in (*txt).split(|c| c.is_ascii_whitespace()) {
         if word.is_empty() {
@@ -128,7 +151,7 @@ fn normalize_whitespace(txt: &BytesText) -> Event<'static> {
         new.push(b' ');
     }
     new.pop();
-    Event::Text(BytesText::from_escaped(new))
+    new
 }
 
 fn main() -> Result<()> {

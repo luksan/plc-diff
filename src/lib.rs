@@ -9,6 +9,38 @@ use arrayvec::ArrayVec;
 use quick_xml::events::{BytesText, Event};
 use quick_xml::Reader;
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum CurrentTag {
+    Id,
+    To,
+    From,
+    InstructionLine,
+    InstructionLineEntity,
+    LadderElements,
+    Other,
+    None,
+}
+
+impl Default for CurrentTag {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl From<&[u8]> for CurrentTag {
+    fn from(tag: &[u8]) -> Self {
+        match tag {
+            b"Id" => Self::Id,
+            b"From" => Self::From,
+            b"To" => Self::To,
+            b"InstructionLine" => Self::InstructionLine,
+            b"InstructionLineEntity" => Self::InstructionLineEntity,
+            b"LadderElements" => Self::LadderElements,
+            _ => Self::Other,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct Guid(ArrayVec<u8, 36>); // "8bff0fc0-0ad4-40a4-a4c7-c6a5c1df96b7"
 
@@ -117,12 +149,6 @@ mod test {
     use super::*;
 
     struct NodeCounter(usize);
-    impl NodeCounter {
-        pub fn count(&mut self) {
-            self.0 += 1;
-        }
-    }
-
     impl XmlNodeVisitor for NodeCounter {
         fn visit<'a>(&mut self, event: Event<'a>, _curr: CurrentTag) -> VisitResult<'a> {
             self.0 += 1;
@@ -144,35 +170,5 @@ mod test {
         .unwrap();
 
         println!("Total xml nodes processed: {}", counter.0)
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum CurrentTag {
-    Id,
-    To,
-    From,
-    InstructionLine,
-    LadderElements,
-    Other,
-    None,
-}
-
-impl Default for CurrentTag {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-impl From<&[u8]> for CurrentTag {
-    fn from(tag: &[u8]) -> Self {
-        match tag {
-            b"Id" => Self::Id,
-            b"From" => Self::From,
-            b"To" => Self::To,
-            b"InstructionLine" => Self::InstructionLine,
-            b"LadderElements" => Self::LadderElements,
-            _ => Self::Other,
-        }
     }
 }
