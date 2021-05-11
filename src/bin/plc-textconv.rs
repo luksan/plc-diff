@@ -1,19 +1,23 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use arrayvec::ArrayVec;
 use itertools::Itertools;
-use quick_xml::events::{BytesText, Event};
+use quick_xml::events::{BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
+use std::collections::HashMap;
+use std::convert::{TryFrom, TryInto};
 use std::env;
+use std::mem::take;
+use std::path::Path;
+
 #[allow(unused_imports)]
 use std::fs::File;
 #[allow(unused_imports)]
 use std::io::BufWriter;
-use std::path::Path;
 
-use arrayvec::ArrayVec;
-use plc_diff::{process_file, CurrentTag, GuidMap, VisitProcessing, VisitResult, XmlNodeVisitor};
-use std::collections::HashMap;
-use std::convert::TryFrom;
+use plc_diff::{
+    process_file, CurrentTag, Guid, GuidMap, VisitProcessing, VisitResult, XmlNodeVisitor,
+};
 
 #[derive(Debug)]
 struct NormalizeInstructionLine<'a> {
@@ -138,7 +142,6 @@ impl XmlNodeVisitor for SkipTag {
 }
 
 struct EventWriter<T: std::io::Write>(Writer<T>);
-
 impl<T: std::io::Write> XmlNodeVisitor for EventWriter<T> {
     fn visit<'a>(&mut self, event: Event<'a>, _: CurrentTag) -> VisitResult<'a> {
         self.0.write_event(&event)?;
@@ -151,7 +154,6 @@ struct IoNames {
     names: HashMap<ArrayVec<u8, 30>, ArrayVec<u8, 30>>,
     current: ArrayVec<u8, 30>,
 }
-
 impl IoNames {
     fn new() -> Self {
         Self {
@@ -163,7 +165,6 @@ impl IoNames {
         self.names.get(address).map(|v| v.as_ref())
     }
 }
-
 impl XmlNodeVisitor for IoNames {
     fn visit<'a>(&mut self, event: Event<'a>, current: CurrentTag) -> VisitResult<'a> {
         match &event {
@@ -183,54 +184,162 @@ impl XmlNodeVisitor for IoNames {
         Ok(VisitProcessing::Continue(event))
     }
 }
+
 #[derive(Debug, Default)]
 struct Rung {
     name: Vec<u8>,
     main_comment: Vec<u8>,
 }
-
 #[derive(Debug, Default)]
 struct NameTracker {
     rungs: Vec<Rung>,
+    ids: HashMap<Guid, String>,
     names: Vec<(usize, String)>,
     new_comment: Vec<u8>,
+    new_id: Guid,
     depth: usize,
 }
-
+impl NameTracker {
+    fn mk_rung_name(&self) -> Vec<u8> {
+        self.names
+            .iter()
+            .skip(1) // Skip the project name
+            .take_while(|(depth, _)| depth <= &(self.depth + 2))
+            .map(|(_, name)| name.as_str())
+            .join(" > ")
+            .into()
+    }
+    fn latest_name(&self) -> String {
+        self.names
+            .last()
+            .map_or_else(String::new, |(_, name)| name.clone())
+    }
+    fn remove_old_names(&mut self) {
+        while self
+            .names
+            .last()
+            .map_or(false, |(depth, _)| depth >= &self.depth)
+        {
+            self.names.pop();
+        }
+    }
+}
 impl XmlNodeVisitor for NameTracker {
     fn visit<'a>(&mut self, event: Event<'a>, current: CurrentTag) -> VisitResult<'a> {
         match &event {
-            Event::Text(txt) if current == CurrentTag::Name => {
-                while self
-                    .names
-                    .last()
-                    .map_or(false, |(depth, _)| depth >= &self.depth)
-                {
-                    self.names.pop();
+            Event::Text(txt) => match current {
+                CurrentTag::Id => self.new_id = txt.try_into()?,
+                CurrentTag::MainComment => self.new_comment = txt.to_vec(),
+                CurrentTag::Name => {
+                    self.remove_old_names();
+                    self.names
+                        .push((self.depth, std::str::from_utf8(&**txt)?.to_string()));
                 }
-                self.names
-                    .push((self.depth, std::str::from_utf8(&**txt)?.to_string()));
-            }
-            Event::Text(txt) if current == CurrentTag::MainComment => {
-                self.new_comment = Vec::from(&**txt);
-            }
+                _ => {}
+            },
             Event::Start(_) => self.depth += 1,
             Event::End(_) => {
-                let stupid_borrowchecker = self.depth + 1;
-                self.names
-                    .retain(|(depth, _)| depth <= &stupid_borrowchecker);
-                self.depth -= 1;
-                if current == CurrentTag::RungEntity {
-                    let main_comment = std::mem::replace(&mut self.new_comment, Vec::new());
-                    let name = self
-                        .names
-                        .iter()
-                        .skip(1) // Skip the project name
-                        .map(|(_, name)| name.as_str())
-                        .join(" > ")
-                        .into();
-                    self.rungs.push(Rung { name, main_comment });
+                match current {
+                    CurrentTag::RungEntity => {
+                        let main_comment = std::mem::replace(&mut self.new_comment, Vec::new());
+                        let name = self.mk_rung_name();
+                        self.rungs.push(Rung { name, main_comment });
+                    }
+                    CurrentTag::GrafcetNodeStep => {
+                        let name = self
+                            .names
+                            .iter()
+                            .find(|&&(depth, _)| depth > self.depth)
+                            .map_or_else(String::new, |(_, name)| name.clone());
+                        self.ids.insert(self.new_id.clone(), name);
+                    }
+                    CurrentTag::GrafcetTransition => {
+                        let name = self.latest_name();
+                        self.ids.insert(self.new_id.clone(), name);
+                        self.remove_old_names();
+                    }
+                    _ => {}
                 }
+                self.depth -= 1;
+            }
+            _ => {}
+        }
+        Ok(VisitProcessing::Continue(event))
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct GrafcetNode {
+    id: Guid,
+    from: Vec<Guid>,
+    to: Vec<Guid>,
+}
+#[derive(Debug, Default)]
+pub struct GrafcetCounter(usize);
+impl GrafcetCounter {
+    pub fn process_current_tag(&mut self, current: CurrentTag) -> bool {
+        match current {
+            CurrentTag::GrafcetNodeStep
+            | CurrentTag::GrafcetTransition
+            | CurrentTag::GrafcetOrFork
+            | CurrentTag::GrafcetOrJunction => {
+                self.0 += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+#[derive(Debug, Default)]
+pub struct GrafcetTracer {
+    nodes: HashMap<Guid, GrafcetNode>,
+    sequence: Vec<Guid>,
+    counter: GrafcetCounter,
+    new_node: (usize, GrafcetNode),
+    current_depth: usize,
+}
+impl GrafcetTracer {
+    pub fn get_unique_link(&self, id: &Guid) -> &Guid {
+        let curr = &self.nodes[id];
+        assert!(curr.to.len() == 1 || curr.from.len() == 1);
+        if curr.to.len() == 1 {
+            &curr.to[0]
+        } else {
+            &curr.from[0]
+        }
+    }
+    pub fn get_current_node(&self, cnt: &GrafcetCounter) -> &GrafcetNode {
+        &self.nodes[&self.sequence[cnt.0 - 1]]
+    }
+}
+impl XmlNodeVisitor for GrafcetTracer {
+    fn visit<'a>(&mut self, event: Event<'a>, current: CurrentTag) -> VisitResult<'a> {
+        match &event {
+            Event::Text(txt) => match current {
+                CurrentTag::Id => {
+                    self.new_node.0 = self.current_depth;
+                    self.new_node.1.id = txt.try_into()?
+                }
+                CurrentTag::To => self.new_node.1.to.push(txt.try_into()?),
+                CurrentTag::From => self.new_node.1.from.push(txt.try_into()?),
+                _ => {}
+            },
+            Event::Start(_) => self.current_depth += 1,
+            Event::End(_) => {
+                if self.current_depth + 1 < self.new_node.0 {
+                    bail!("Failed to generate grafcet trace {:?}", self.new_node);
+                }
+                if self.counter.process_current_tag(current) {
+                    assert!(
+                        (self.new_node.1.from.len() == 1) || (self.new_node.1.to.len() == 1),
+                        "{:?}",
+                        self.new_node
+                    );
+                    let (_depth, node) = take(&mut self.new_node);
+                    self.sequence.push(node.id.clone());
+                    self.nodes.insert(node.id.clone(), node);
+                }
+                self.current_depth -= 1;
             }
             _ => {}
         }
@@ -241,28 +350,57 @@ impl XmlNodeVisitor for NameTracker {
 #[derive(Debug)]
 struct DiffHeader<'a> {
     trk: &'a NameTracker,
+    grc: &'a GrafcetTracer,
+    grc_cnt: GrafcetCounter,
     current_rung: usize,
 }
 impl<'a> DiffHeader<'a> {
-    fn new(trk: &'a NameTracker) -> Self {
+    pub fn new(trk: &'a NameTracker, grc: &'a GrafcetTracer) -> Self {
         Self {
             trk,
+            grc,
+            grc_cnt: Default::default(),
             current_rung: 0,
         }
     }
+    fn add_ctx_attr(bytes: &mut BytesStart, hdr: &dyn AsRef<[u8]>) {
+        bytes.push_attribute((&b"ctx"[..], hdr.as_ref()));
+    }
+    fn id(&self, id: &'a Guid) -> &'a str {
+        if let Some(name) = &self.trk.ids.get(id) {
+            name
+        } else {
+            let x = self.grc.get_unique_link(id);
+            self.id(x)
+        }
+    }
+    fn trans_ctx(&self) -> Vec<u8> {
+        let node = self.grc.get_current_node(&self.grc_cnt);
+        assert_eq!(node.from.len(), 1, "{:?}", node);
+        assert_eq!(node.to.len(), 1);
+        format!(
+            "{}->[{}]->{}",
+            self.id(&node.from[0]),
+            self.id(&node.id),
+            self.id(&node.to[0])
+        )
+        .into()
+    }
 }
-
 impl XmlNodeVisitor for DiffHeader<'_> {
     fn visit<'a>(&mut self, mut event: Event<'a>, current: CurrentTag) -> VisitResult<'a> {
-        match &mut event {
-            Event::Start(bytes) if current == CurrentTag::RungEntity => {
-                bytes.push_attribute((
-                    &b"ctx"[..],
-                    self.trk.rungs[self.current_rung].name.as_slice(),
-                ));
-                self.current_rung += 1;
+        if let Event::Start(bytes) = &mut event {
+            self.grc_cnt.process_current_tag(current);
+            match current {
+                CurrentTag::RungEntity => {
+                    Self::add_ctx_attr(bytes, &self.trk.rungs[self.current_rung].name);
+                    self.current_rung += 1;
+                }
+                CurrentTag::GrafcetTransition => {
+                    Self::add_ctx_attr(bytes, &self.trans_ctx());
+                }
+                _ => {}
             }
-            _ => {}
         }
         Ok(VisitProcessing::Continue(event))
     }
@@ -270,12 +408,14 @@ impl XmlNodeVisitor for DiffHeader<'_> {
 
 fn output_visitor(filename: &Path) -> Result<()> {
     let mut ionames = IoNames::new();
-    let mut pou_tracker = NameTracker::default();
+    let mut name_tracker = NameTracker::default();
+    let mut grafcet_tracer = GrafcetTracer::default();
     process_file(
         filename,
         &mut [
-            &mut ionames,     // Collect symbols for IO addresses
-            &mut pou_tracker, // Collect context for diff headers
+            &mut ionames,        // Collect symbols for IO addresses
+            &mut name_tracker,   // Collect context for diff headers
+            &mut grafcet_tracer, // Check the Grafcet node connections
         ],
     )
     .context("Pre-processing failed")?;
@@ -288,14 +428,14 @@ fn output_visitor(filename: &Path) -> Result<()> {
     let mut writer = EventWriter(Writer::new(out));
     let mut tag_skipper = SkipTag::new(CurrentTag::LadderElements);
     let mut inst_line_mangle = NormalizeInstructionLine::new(&ionames);
-    let mut diff_headers = DiffHeader::new(&pou_tracker);
+    let mut diff_headers = DiffHeader::new(&name_tracker, &grafcet_tracer);
     process_file(
         filename,
         &mut [
             &mut tag_skipper,      // skip ladder diagram tags
-            &mut guid_map,         // map GUID
             &mut diff_headers,     // Generate diff headers
             &mut inst_line_mangle, // Mangle instruction lines
+            &mut guid_map,         // map GUID
             &mut writer,           // write output
         ],
     )

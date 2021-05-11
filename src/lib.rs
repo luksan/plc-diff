@@ -1,6 +1,7 @@
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
+use std::fmt::{self, Debug, Display, Formatter};
 use std::hash::Hash;
 use std::path::Path;
 
@@ -15,6 +16,10 @@ pub enum CurrentTag {
     Id,
     To,
     From,
+    GrafcetNodeStep,
+    GrafcetOrFork,
+    GrafcetOrJunction,
+    GrafcetTransition,
     InstructionLine,
     InstructionLineEntity,
     MainComment,
@@ -39,6 +44,10 @@ impl From<&[u8]> for CurrentTag {
             b"Id" => Self::Id,
             b"From" => Self::From,
             b"To" => Self::To,
+            b"GrafcetNodeStep" => Self::GrafcetNodeStep,
+            b"GrafcetOrFork" => Self::GrafcetOrFork,
+            b"GrafcetOrJunction" => Self::GrafcetOrJunction,
+            b"GrafcetTransition" => Self::GrafcetTransition,
             b"InstructionLine" => Self::InstructionLine,
             b"InstructionLineEntity" => Self::InstructionLineEntity,
             b"LadderElements" => Self::LadderElements,
@@ -51,8 +60,24 @@ impl From<&[u8]> for CurrentTag {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct Guid(ArrayVec<u8, 36>); // "8bff0fc0-0ad4-40a4-a4c7-c6a5c1df96b7"
+#[derive(Default, Clone, Hash, PartialEq, Eq)]
+pub struct Guid(ArrayVec<u8, 36>); // "8bff0fc0-0ad4-40a4-a4c7-c6a5c1df96b7"
+
+impl AsRef<[u8]> for Guid {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+impl Debug for Guid {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "Guid({})", std::str::from_utf8(self.as_ref()).unwrap())
+    }
+}
+impl Display for Guid {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", std::str::from_utf8(self.as_ref()).unwrap())
+    }
+}
 
 impl TryFrom<&BytesText<'_>> for Guid {
     type Error = AnyError;
