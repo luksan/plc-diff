@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use itertools::Itertools;
 use quick_xml::events::{BytesText, Event};
 use quick_xml::Writer;
 
@@ -182,10 +183,102 @@ impl XmlNodeVisitor for IoNames {
         Ok(VisitProcessing::Continue(event))
     }
 }
+#[derive(Debug, Default)]
+struct Rung {
+    name: Vec<u8>,
+    main_comment: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct NameTracker {
+    rungs: Vec<Rung>,
+    names: Vec<(usize, String)>,
+    new_comment: Vec<u8>,
+    depth: usize,
+}
+
+impl XmlNodeVisitor for NameTracker {
+    fn visit<'a>(&mut self, event: Event<'a>, current: CurrentTag) -> VisitResult<'a> {
+        match &event {
+            Event::Text(txt) if current == CurrentTag::Name => {
+                while self
+                    .names
+                    .last()
+                    .map_or(false, |(depth, _)| depth >= &self.depth)
+                {
+                    self.names.pop();
+                }
+                self.names
+                    .push((self.depth, std::str::from_utf8(&**txt)?.to_string()));
+            }
+            Event::Text(txt) if current == CurrentTag::MainComment => {
+                self.new_comment = Vec::from(&**txt);
+            }
+            Event::Start(_) => self.depth += 1,
+            Event::End(_) => {
+                let stupid_borrowchecker = self.depth + 1;
+                self.names
+                    .retain(|(depth, _)| depth <= &stupid_borrowchecker);
+                self.depth -= 1;
+                if current == CurrentTag::RungEntity {
+                    let main_comment = std::mem::replace(&mut self.new_comment, Vec::new());
+                    let name = self
+                        .names
+                        .iter()
+                        .skip(1) // Skip the project name
+                        .map(|(_, name)| name.as_str())
+                        .join(" > ")
+                        .into();
+                    self.rungs.push(Rung { name, main_comment });
+                }
+            }
+            _ => {}
+        }
+        Ok(VisitProcessing::Continue(event))
+    }
+}
+
+#[derive(Debug)]
+struct DiffHeader<'a> {
+    trk: &'a NameTracker,
+    current_rung: usize,
+}
+impl<'a> DiffHeader<'a> {
+    fn new(trk: &'a NameTracker) -> Self {
+        Self {
+            trk,
+            current_rung: 0,
+        }
+    }
+}
+
+impl XmlNodeVisitor for DiffHeader<'_> {
+    fn visit<'a>(&mut self, mut event: Event<'a>, current: CurrentTag) -> VisitResult<'a> {
+        match &mut event {
+            Event::Start(bytes) if current == CurrentTag::RungEntity => {
+                bytes.push_attribute((
+                    &b"ctx"[..],
+                    self.trk.rungs[self.current_rung].name.as_slice(),
+                ));
+                self.current_rung += 1;
+            }
+            _ => {}
+        }
+        Ok(VisitProcessing::Continue(event))
+    }
+}
 
 fn output_visitor(filename: &Path) -> Result<()> {
     let mut ionames = IoNames::new();
-    process_file(filename, &mut [&mut ionames]).context("Pre-processing failed")?;
+    let mut pou_tracker = NameTracker::default();
+    process_file(
+        filename,
+        &mut [
+            &mut ionames,     // Collect symbols for IO addresses
+            &mut pou_tracker, // Collect context for diff headers
+        ],
+    )
+    .context("Pre-processing failed")?;
 
     // let out = BufWriter::new(File::create("out.xml")?);
     // let out = std::io::sink();
@@ -195,12 +288,14 @@ fn output_visitor(filename: &Path) -> Result<()> {
     let mut writer = EventWriter(Writer::new(out));
     let mut tag_skipper = SkipTag::new(CurrentTag::LadderElements);
     let mut inst_line_mangle = NormalizeInstructionLine::new(&ionames);
+    let mut diff_headers = DiffHeader::new(&pou_tracker);
     process_file(
         filename,
         &mut [
             &mut tag_skipper,      // skip ladder diagram tags
             &mut guid_map,         // map GUID
-            &mut inst_line_mangle, // Normalize whitespace
+            &mut diff_headers,     // Generate diff headers
+            &mut inst_line_mangle, // Mangle instruction lines
             &mut writer,           // write output
         ],
     )

@@ -9,4 +9,5 @@ edition = "2018"
 [dependencies]
 anyhow = "1.0"
 arrayvec = "0.7"
+itertools = "0.10"
 quick-xml = "0.22"
