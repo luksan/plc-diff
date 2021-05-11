@@ -1,3 +1,5 @@
+pub mod grafcet;
+
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
