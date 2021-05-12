@@ -1,8 +1,10 @@
 [package]
 name = "plc-diff"
 version = "0.1.0"
+description = "Tools for managing Machine Expert - Basic projects in Git"
 authors = ["Lukas Sandström <lukas.sandstrom@chalmers.se>"]
 edition = "2018"
+license = "GPL-3.0-only"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
