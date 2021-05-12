@@ -5,6 +5,7 @@ use std::env;
 use std::fs::File;
 #[allow(unused_imports)]
 use std::io::BufWriter;
+use std::mem::take;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -151,7 +152,8 @@ impl<T: std::io::Write> XmlNodeVisitor for EventWriter<T> {
 #[derive(Debug, Default)]
 struct IoNames {
     names: HashMap<ArrayVec<u8, 30>, ArrayVec<u8, 30>>,
-    current: ArrayVec<u8, 30>,
+    new_address: (usize, ArrayVec<u8, 30>),
+    depth: usize,
 }
 impl IoNames {
     fn new() -> Self {
@@ -167,14 +169,23 @@ impl IoNames {
 impl XmlNodeVisitor for IoNames {
     fn visit<'a>(&mut self, event: Event<'a>, current: CurrentTag) -> VisitResult<'a> {
         match &event {
+            Event::Start(_) => self.depth += 1,
+            Event::End(_) => {
+                self.depth -= 1;
+                if self.depth + 2 < self.new_address.0 {
+                    take(&mut self.new_address);
+                }
+            }
             Event::Text(txt) if current == CurrentTag::Address => {
-                self.current =
-                    ArrayVec::try_from(&**txt).with_context(|| format!("{:?}", event))?;
+                self.new_address = (
+                    self.depth,
+                    ArrayVec::try_from(&**txt).with_context(|| format!("{:?}", event))?,
+                );
             }
             Event::Text(txt) if current == CurrentTag::Symbol => {
-                let c = std::mem::replace(&mut self.current, ArrayVec::new());
+                let (_, address) = take(&mut self.new_address);
                 self.names.insert(
-                    c,
+                    address,
                     ArrayVec::try_from(&**txt).with_context(|| format!("{:?}", event))?,
                 );
             }
